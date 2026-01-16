@@ -1,0 +1,36 @@
+# Build artifacts
+/target/
+wolflib/target/
+
+# Cargo lock files (optional for binaries, keep for libraries)
+# Cargo.lock is kept for reproducible builds
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local configuration (don't commit actual config)
+wolfserve.toml
+server.log
+
+# Backup directories with local data
+backups_opensimngc/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SSL private keys and certificates (sensitive!)
+*.key
+*.pem
+
+# Conversation/chat history
+.codewolf/
+
+# Release packages
+release-package/
+*.tar.gz
+copyfiles

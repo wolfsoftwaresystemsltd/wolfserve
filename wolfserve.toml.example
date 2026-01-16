@@ -1,0 +1,15 @@
+# WolfServe Configuration
+
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[php]
+fpm_address = "127.0.0.1:9993"
+
+[apache]
+# Set this to "/etc/apache2" (Debian/Ubuntu) or "/etc/httpd" (RHEL/CentOS)
+# to load system Apache configurations.
+config_dir = "/etc/apache2"
+
+
