@@ -26,7 +26,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 
 mod apache;
-use apache::VirtualHost;
+use apache::{VirtualHost, RewriteContext, RewriteResult};
 use hyper_util::rt::TokioIo;
 
 #[derive(Clone)]
@@ -348,6 +348,8 @@ config_dir = "/etc/apache2"
 
 async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request) -> Response {
     let uri_path = req.uri().path().to_string();
+    let query_string = req.uri().query().unwrap_or("").to_string();
+    let method = req.method().to_string();
     
     // Safety: prevent traversing up
     let clean_path = uri_path.trim_start_matches('/');
@@ -355,29 +357,89 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
-    // Determine Document Root based on Host header
+    // Determine Document Root and VHost based on Host header
     let mut doc_root = PathBuf::from("public");
+    let mut current_vhost: Option<&apache::VirtualHost> = None;
+    let mut host_name = String::new();
+    
     if let Some(host_header) = headers.get("host") {
         if let Ok(host_str) = host_header.to_str() {
             // Remove port if present
-            let host_name = host_str.split(':').next().unwrap_or(host_str);
-            if let Some(vhost) = state.vhosts.get(host_name) {
+            host_name = host_str.split(':').next().unwrap_or(host_str).to_string();
+            if let Some(vhost) = state.vhosts.get(&host_name) {
+                current_vhost = Some(vhost);
                 if let Some(root) = &vhost.document_root {
                     doc_root = root.clone();
                 }
             } else if let Some(vhost) = &state.default_vhost {
+                current_vhost = Some(vhost);
                 if let Some(root) = &vhost.document_root {
                     doc_root = root.clone();
                 }
             }
         }
     } else if let Some(vhost) = &state.default_vhost {
+        current_vhost = Some(vhost);
         if let Some(root) = &vhost.document_root {
             doc_root = root.clone();
         }
     }
 
-    let mut path = doc_root.join(clean_path);
+    // Check for redirects from vhost config first
+    if let Some(vhost) = current_vhost {
+        for redirect in &vhost.redirects {
+            if let Some((status_code, target)) = redirect.matches(&uri_path) {
+                return handle_redirect(status_code, target);
+            }
+        }
+    }
+
+    // Check for .htaccess in document root
+    let htaccess_path = doc_root.join(".htaccess");
+    let mut rewritten_path = uri_path.clone();
+    
+    if htaccess_path.exists() {
+        if let Some(htaccess) = apache::parse_htaccess(&htaccess_path) {
+            // Check .htaccess redirects
+            for redirect in &htaccess.redirects {
+                if let Some((status_code, target)) = redirect.matches(&uri_path) {
+                    return handle_redirect(status_code, target);
+                }
+            }
+            
+            // Check rewrite rules
+            let request_filename = doc_root.join(clean_path);
+            let is_https = headers.get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "https")
+                .unwrap_or(false);
+            
+            let ctx = RewriteContext {
+                request_uri: &uri_path,
+                request_filename: &request_filename,
+                query_string: &query_string,
+                http_host: &host_name,
+                request_method: &method,
+                https: is_https,
+                document_root: &doc_root,
+            };
+            
+            if let Some(result) = htaccess.apply_rewrites(&ctx) {
+                match result {
+                    RewriteResult::Redirect { url, status } => {
+                        return handle_redirect(status, Some(url));
+                    }
+                    RewriteResult::InternalRewrite { path } => {
+                        rewritten_path = path;
+                    }
+                }
+            }
+        }
+    }
+
+    // Use the rewritten path
+    let clean_rewritten = rewritten_path.trim_start_matches('/');
+    let mut path = doc_root.join(clean_rewritten);
 
     // Resolve directory index
     if path.is_dir() {
@@ -390,8 +452,15 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         }
     }
 
+    // If file doesn't exist after rewrite, still try to serve (WordPress may handle it)
     if !path.exists() {
-         return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        // For WordPress: if we have a rewrite to index.php, use that
+        let index_php = doc_root.join("index.php");
+        if index_php.exists() && rewritten_path != uri_path {
+            // This was an internal rewrite - WordPress will handle routing
+            return handle_php(state, req, index_php).await;
+        }
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
 
 
@@ -403,6 +472,66 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
 
     // Serve static file
     serve_static_file(path).await
+}
+
+/// Handle redirect responses based on status code
+fn handle_redirect(status_code: u16, target: Option<String>) -> Response {
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FOUND);
+    
+    match target {
+        Some(url) => {
+            // Create redirect response with Location header
+            let mut response = Response::builder()
+                .status(status)
+                .header(axum::http::header::LOCATION, &url)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            
+            // For 3xx redirects, add a helpful HTML body
+            if (300..400).contains(&status_code) {
+                let body = format!(
+                    "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n\
+                    <html><head>\n\
+                    <title>{} {}</title>\n\
+                    </head><body>\n\
+                    <h1>{}</h1>\n\
+                    <p>The document has moved <a href=\"{}\">here</a>.</p>\n\
+                    </body></html>",
+                    status_code,
+                    status.canonical_reason().unwrap_or("Redirect"),
+                    status.canonical_reason().unwrap_or("Redirect"),
+                    url
+                );
+                response = Response::builder()
+                    .status(status)
+                    .header(axum::http::header::LOCATION, &url)
+                    .header(axum::http::header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
+                    .body(axum::body::Body::from(body))
+                    .unwrap();
+            }
+            response
+        }
+        None => {
+            // No target URL - likely a 410 Gone response
+            let body = format!(
+                "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n\
+                <html><head>\n\
+                <title>{} {}</title>\n\
+                </head><body>\n\
+                <h1>{}</h1>\n\
+                <p>The requested resource is no longer available on this server.</p>\n\
+                </body></html>",
+                status_code,
+                status.canonical_reason().unwrap_or("Gone"),
+                status.canonical_reason().unwrap_or("Gone")
+            );
+            Response::builder()
+                .status(status)
+                .header(axum::http::header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+    }
 }
 
 async fn serve_static_file(path: PathBuf) -> Response {
@@ -536,10 +665,40 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
     params.insert(Cow::Borrowed("REQUEST_METHOD"), Cow::Owned(parts.method.as_str().to_string()));
     params.insert(Cow::Borrowed("SCRIPT_FILENAME"), Cow::Owned(script_filename));
     params.insert(Cow::Borrowed("SCRIPT_NAME"), Cow::Owned(parts.uri.path().to_string()));
+    params.insert(Cow::Borrowed("REQUEST_URI"), Cow::Owned(parts.uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_else(|| parts.uri.path().to_string())));
     params.insert(Cow::Borrowed("QUERY_STRING"), Cow::Owned(parts.uri.query().unwrap_or("").to_string()));
     params.insert(Cow::Borrowed("SERVER_SOFTWARE"), Cow::Borrowed("wolfserve/0.1.0"));
-    params.insert(Cow::Borrowed("REMOTE_ADDR"), Cow::Borrowed("127.0.0.1")); 
     params.insert(Cow::Borrowed("SERVER_PROTOCOL"), Cow::Borrowed("HTTP/1.1"));
+    params.insert(Cow::Borrowed("GATEWAY_INTERFACE"), Cow::Borrowed("CGI/1.1"));
+    
+    // Handle proxy headers for real client IP
+    let remote_addr = parts.headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| parts.headers.get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    params.insert(Cow::Borrowed("REMOTE_ADDR"), Cow::Owned(remote_addr));
+    
+    // Handle HTTPS detection for proxied requests
+    let is_https = parts.headers.get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    if is_https {
+        params.insert(Cow::Borrowed("HTTPS"), Cow::Borrowed("on"));
+    }
+    
+    // Server name from Host header
+    if let Some(host) = parts.headers.get("host") {
+        if let Ok(host_str) = host.to_str() {
+            let server_name = host_str.split(':').next().unwrap_or(host_str);
+            params.insert(Cow::Borrowed("SERVER_NAME"), Cow::Owned(server_name.to_string()));
+            params.insert(Cow::Borrowed("HTTP_HOST"), Cow::Owned(host_str.to_string()));
+        }
+    }
     
     // Handle headers
     for (name, value) in parts.headers.iter() {

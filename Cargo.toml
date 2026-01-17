@@ -25,4 +25,5 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 futures-util = "0.3"
 hyper-util = { version = "0.1.19", features = ["full"] }
+regex = "1"
 
