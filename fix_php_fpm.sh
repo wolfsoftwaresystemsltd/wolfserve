@@ -16,9 +16,9 @@ for version in 8.3 8.2 8.1 8.0 7.4; do
             echo "  - Fixed post_max_size (was 0)"
         fi
         
-        # Ensure upload settings are reasonable
-        sed -i 's/^upload_max_filesize = 2M/upload_max_filesize = 256M/' "$ini_file"
-        sed -i 's/^post_max_size = 8M/post_max_size = 520M/' "$ini_file"
+        # Ensure upload settings are reasonable (10GB for large OAR files etc)
+        sed -i 's/^upload_max_filesize.*/upload_max_filesize = 10G/' "$ini_file"
+        sed -i 's/^post_max_size.*/post_max_size = 10G/' "$ini_file"
         
         # Ensure file_uploads is on
         sed -i 's/^file_uploads = Off/file_uploads = On/' "$ini_file"
