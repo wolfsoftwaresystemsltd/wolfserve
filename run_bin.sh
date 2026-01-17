@@ -52,8 +52,11 @@ listen = 127.0.0.1:9993
 pm = static
 pm.max_children = 5
 php_admin_value[ffi.enable] = true
+php_admin_value[file_uploads] = On
 php_admin_value[upload_max_filesize] = 256M
 php_admin_value[post_max_size] = 256M
+php_admin_value[upload_tmp_dir] = /tmp
+php_admin_value[max_file_uploads] = 20
 EOF
 
     # Find the fpm binary
