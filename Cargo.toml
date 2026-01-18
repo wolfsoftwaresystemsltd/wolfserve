@@ -11,7 +11,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.4", features = ["fs", "trace"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "compression-gzip", "compression-br", "compression-deflate"] }
 
 hyper = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

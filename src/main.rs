@@ -24,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use futures_util::future::join_all;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
+use tower_http::compression::CompressionLayer;
 
 mod apache;
 use apache::{VirtualHost, RewriteContext, RewriteResult};
@@ -269,6 +270,7 @@ config_dir = "/etc/apache2"
     });
     let app = Router::new()
         .fallback(any(handle_request))
+        .layer(CompressionLayer::new())
         .with_state(state.clone());
 
     let mut tasks = Vec::new();

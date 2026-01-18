@@ -1,5 +1,5 @@
 # Copy source and config files for remote building (avoids GLIBC version errors)
-FILES="src wolflib Cargo.toml install_service.sh wolfserve.toml run_bin.sh install.sh build_lib.sh public fix_php_fpm.sh"
+FILES="src wolflib Cargo.toml install_service.sh wolfserve.toml run_bin.sh install.sh build_lib.sh public fix_php_fpm.sh upgrade.sh"
 
 echo "Cleanup remote target to avoid GLIBC conflicts..."
 ssh root@100.123.22.10 "rm -rf /mnt/shared/wolfserve/target /mnt/shared/wolfserve/wolflib/target"

@@ -5,6 +5,8 @@
 #
 # Usage: ./upgrade.sh [new_binary_path]
 #        ./upgrade.sh --rollback
+#        ./upgrade.sh --build      (build and upgrade)
+#        ./upgrade.sh              (auto-find or build binary)
 #
 
 set -e
@@ -17,6 +19,10 @@ BACKUP_DIR="${INSTALL_DIR}/backups"
 MAX_BACKUPS=5
 HEALTH_CHECK_URL="${HEALTH_CHECK_URL:-http://127.0.0.1:3000/}"
 HEALTH_CHECK_TIMEOUT=30
+
+# Try to find the source directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="${WOLFSERVE_SOURCE:-${SCRIPT_DIR}}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -76,6 +82,77 @@ create_backup() {
 
 get_latest_backup() {
     ls -1t "${BACKUP_DIR}/${BINARY_NAME}_"* 2>/dev/null | head -1
+}
+
+# Find binary in common locations
+find_binary() {
+    local locations=(
+        "${SOURCE_DIR}/target/release/${BINARY_NAME}"
+        "${SOURCE_DIR}/target/debug/${BINARY_NAME}"
+        "${SOURCE_DIR}/${BINARY_NAME}"
+        "./target/release/${BINARY_NAME}"
+        "./target/debug/${BINARY_NAME}"
+        "./${BINARY_NAME}"
+    )
+    
+    for loc in "${locations[@]}"; do
+        if [[ -f "${loc}" && -x "${loc}" ]]; then
+            echo "${loc}"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Build the binary from source
+build_binary() {
+    log_info "Building ${BINARY_NAME} from source..." >&2
+    
+    if [[ ! -f "${SOURCE_DIR}/Cargo.toml" ]]; then
+        log_error "Cannot find Cargo.toml in ${SOURCE_DIR}" >&2
+        log_error "Set WOLFSERVE_SOURCE to the source directory or run from source dir" >&2
+        return 1
+    fi
+    
+    cd "${SOURCE_DIR}"
+    
+    # Check if cargo is available
+    if ! command -v cargo &>/dev/null; then
+        log_error "Cargo not found. Please install Rust: https://rustup.rs" >&2
+        return 1
+    fi
+    
+    log_info "Compiling release build (this may take a few minutes)..." >&2
+    if cargo build --release 2>&1; then
+        log_info "Build completed successfully" >&2
+        echo "${SOURCE_DIR}/target/release/${BINARY_NAME}"
+        return 0
+    else
+        log_error "Build failed" >&2
+        return 1
+    fi
+}
+
+# Find or build the binary
+find_or_build_binary() {
+    local binary_path
+    
+    # First try to find an existing binary
+    if binary_path=$(find_binary); then
+        log_info "Found existing binary: ${binary_path}" >&2
+        echo "${binary_path}"
+        return 0
+    fi
+    
+    # No binary found, try to build
+    log_warn "No binary found, attempting to build..." >&2
+    if binary_path=$(build_binary); then
+        echo "${binary_path}"
+        return 0
+    fi
+    
+    return 1
 }
 
 stop_service() {
@@ -145,6 +222,11 @@ install_binary() {
     
     if [[ ! -x "${new_binary}" ]]; then
         chmod +x "${new_binary}"
+    fi
+    
+    # Remove existing binary before installing new one
+    if [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
+        rm -f "${INSTALL_DIR}/${BINARY_NAME}"
     fi
     
     cp "${new_binary}" "${INSTALL_DIR}/${BINARY_NAME}"
@@ -249,19 +331,23 @@ show_usage() {
     echo "WolfServe Upgrade Script"
     echo ""
     echo "Usage:"
-    echo "  $0 <new_binary>     Upgrade to new binary"
+    echo "  $0                  Auto-find binary or build from source, then upgrade"
+    echo "  $0 <binary_path>    Upgrade using specified binary"
+    echo "  $0 --build          Force rebuild from source, then upgrade"
     echo "  $0 --rollback       Rollback to previous version"
     echo "  $0 --status         Show current status"
     echo "  $0 --help           Show this help"
     echo ""
     echo "Environment variables:"
     echo "  WOLFSERVE_DIR       Installation directory (default: /opt/wolfserve)"
+    echo "  WOLFSERVE_SOURCE    Source directory for building (default: script location)"
     echo "  HEALTH_CHECK_URL    Health check URL (default: http://127.0.0.1:3000/)"
     echo ""
     echo "Examples:"
-    echo "  sudo $0 ./target/release/wolfserve"
-    echo "  sudo $0 --rollback"
-    echo "  sudo WOLFSERVE_DIR=/usr/local/wolfserve $0 ./wolfserve"
+    echo "  sudo $0                               # Auto-find or build"
+    echo "  sudo $0 --build                       # Force rebuild"
+    echo "  sudo $0 ./target/release/wolfserve    # Use specific binary"
+    echo "  sudo $0 --rollback                    # Rollback to previous"
 }
 
 # Main
@@ -276,7 +362,23 @@ case "${1:-}" in
     --help|-h)
         show_usage
         ;;
+    --build)
+        check_root
+        binary_path=$(build_binary) || exit 1
+        upgrade "${binary_path}"
+        ;;
     "")
+        # No argument - auto-find or build
+        check_root
+        binary_path=$(find_or_build_binary) || {
+            log_error "Could not find or build binary"
+            log_error "Specify a binary path or run from source directory"
+            exit 1
+        }
+        upgrade "${binary_path}"
+        ;;
+    -*)
+        log_error "Unknown option: $1"
         show_usage
         exit 1
         ;;
