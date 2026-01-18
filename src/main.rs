@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use fastcgi_client::{Client, Params, Request as FcgiRequest};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 use http_body_util::BodyExt;
 use std::borrow::Cow;
 use serde::Deserialize;
@@ -25,9 +25,12 @@ use futures_util::future::join_all;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tower_http::compression::CompressionLayer;
+use chrono::Utc;
 
 mod apache;
+mod admin;
 use apache::{VirtualHost, RewriteContext, RewriteResult};
+use admin::{AdminState, RequestLogEntry, admin_router};
 use hyper_util::rt::TokioIo;
 
 #[derive(Clone)]
@@ -156,6 +159,7 @@ struct AppState {
     config: Config,
     vhosts: HashMap<String, VirtualHost>, // Map Host header -> VirtualHost
     default_vhost: Option<VirtualHost>,
+    admin_state: Arc<AdminState>,
 }
 
 fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
@@ -263,10 +267,14 @@ config_dir = "/etc/apache2"
         }
     }
 
+    // Create shared admin state for statistics and logging
+    let admin_state = Arc::new(AdminState::new());
+
     let state = Arc::new(AppState { 
         config: config.clone(), 
         vhosts: vhosts_map, 
-        default_vhost 
+        default_vhost,
+        admin_state: admin_state.clone(),
     });
     let app = Router::new()
         .fallback(any(handle_request))
@@ -275,6 +283,15 @@ config_dir = "/etc/apache2"
 
     let mut tasks = Vec::new();
     let host_ip = config.server.host.clone();
+
+    // Start Admin Dashboard on port 5000 - always bind to all interfaces
+    let admin_app = admin_router(admin_state.clone());
+    let admin_addr: SocketAddr = "0.0.0.0:5000".parse().unwrap();
+    tasks.push(tokio::spawn(async move {
+        println!("WolfServe Admin Dashboard listening on {} (login: admin/admin)", admin_addr);
+        let listener = tokio::net::TcpListener::bind(&admin_addr).await.unwrap();
+        axum::serve(listener, admin_app).await.unwrap();
+    }));
 
     // Start HTTP Listeners
     for port in http_ports {
@@ -349,14 +366,35 @@ config_dir = "/etc/apache2"
 
 
 async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request) -> Response {
+    let start_time = Instant::now();
     let uri_path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
     let method = req.method().to_string();
     
+    // Extract info for logging before we consume headers
+    let client_ip = headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    
+    let user_agent = headers.get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    
+    let host_for_log = headers.get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    
     // Safety: prevent traversing up
     let clean_path = uri_path.trim_start_matches('/');
     if clean_path.contains("..") {
-        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+        let response = (StatusCode::FORBIDDEN, "Forbidden").into_response();
+        log_request(&state, &method, &uri_path, 403, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+        return response;
     }
 
     // Determine Document Root and VHost based on Host header
@@ -391,7 +429,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     if let Some(vhost) = current_vhost {
         for redirect in &vhost.redirects {
             if let Some((status_code, target)) = redirect.matches(&uri_path) {
-                return handle_redirect(status_code, target);
+                let response = handle_redirect(status_code, target);
+                log_request(&state, &method, &uri_path, status_code, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+                return response;
             }
         }
     }
@@ -405,7 +445,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
             // Check .htaccess redirects
             for redirect in &htaccess.redirects {
                 if let Some((status_code, target)) = redirect.matches(&uri_path) {
-                    return handle_redirect(status_code, target);
+                    let response = handle_redirect(status_code, target);
+                    log_request(&state, &method, &uri_path, status_code, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+                    return response;
                 }
             }
             
@@ -429,7 +471,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
             if let Some(result) = htaccess.apply_rewrites(&ctx) {
                 match result {
                     RewriteResult::Redirect { url, status } => {
-                        return handle_redirect(status, Some(url));
+                        let response = handle_redirect(status, Some(url));
+                        log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+                        return response;
                     }
                     RewriteResult::InternalRewrite { path } => {
                         rewritten_path = path;
@@ -450,7 +494,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         } else if path.join("index.html").exists() {
             path = path.join("index.html");
         } else {
-             return (StatusCode::FORBIDDEN, "Directory listing denied").into_response();
+            let response = (StatusCode::FORBIDDEN, "Directory listing denied").into_response();
+            log_request(&state, &method, &uri_path, 403, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+            return response;
         }
     }
 
@@ -460,20 +506,46 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         let index_php = doc_root.join("index.php");
         if index_php.exists() && rewritten_path != uri_path {
             // This was an internal rewrite - WordPress will handle routing
-            return handle_php(state, req, index_php).await;
+            let response = handle_php(state.clone(), req, index_php).await;
+            let status = response.status().as_u16();
+            log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+            return response;
         }
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        let response = (StatusCode::NOT_FOUND, "Not Found").into_response();
+        log_request(&state, &method, &uri_path, 404, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+        return response;
     }
 
 
     if let Some(ext) = path.extension() {
         if ext == "php" {
-            return handle_php(state, req, path).await;
+            let response = handle_php(state.clone(), req, path).await;
+            let status = response.status().as_u16();
+            log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+            return response;
         }
     }
 
     // Serve static file
-    serve_static_file(path).await
+    let response = serve_static_file(path).await;
+    let status = response.status().as_u16();
+    log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
+    response
+}
+
+/// Log a request to the admin state
+fn log_request(state: &AppState, method: &str, path: &str, status: u16, duration_ms: u64, client_ip: &str, host: &str, user_agent: &str) {
+    let entry = RequestLogEntry {
+        timestamp: Utc::now(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status,
+        duration_ms,
+        client_ip: client_ip.to_string(),
+        host: host.to_string(),
+        user_agent: user_agent.to_string(),
+    };
+    state.admin_state.log_request(entry);
 }
 
 /// Handle redirect responses based on status code
