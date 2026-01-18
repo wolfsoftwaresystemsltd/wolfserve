@@ -13,7 +13,39 @@ A high-performance web server written in Rust that serves PHP applications via F
 - **Apache Compatible** - Reads existing Apache vhost configurations
 - **Static Files** - Serves static assets efficiently
 - **PHP FFI Bridge** - Call Rust functions directly from PHP via libwolflib
+- **Admin Dashboard** - Real-time monitoring, statistics, and request logging on port 5000
 - **Cross-Platform** - Works on Debian/Ubuntu, Fedora/RHEL, Arch Linux, openSUSE
+
+## 📊 Admin Dashboard
+
+WolfServe includes a built-in admin dashboard accessible on **port 5000** for monitoring and statistics.
+
+### Features
+
+- **Real-time Statistics** - Total requests, response codes (2xx/3xx/4xx/5xx), avg response time, requests/sec
+- **Request Logging** - Last 50 requests with method, path, status, duration, client IP, and host
+- **Uptime Tracking** - Server uptime displayed in days, hours, minutes, seconds
+- **Auto-refresh** - Dashboard updates every 5 seconds
+- **Secure Authentication** - Session-based login with bcrypt password hashing
+
+### Default Credentials
+
+- **Username**: `admin`
+- **Password**: `admin`
+
+⚠️ **Important**: Change the default password immediately after first login!
+
+### Access
+
+```
+http://your-server:5000/
+```
+
+The dashboard binds to `0.0.0.0:5000` and is accessible from any interface, including through proxies.
+
+### Password Storage
+
+Credentials are stored in `wolfserve_admin.dat` using base64 encoding with bcrypt password hashing. The file is created automatically on first run.
 
 ## 📋 Requirements
 
@@ -83,7 +115,8 @@ config_dir = "/etc/apache2"
 wolfserve/
 ├── src/
 │   ├── main.rs          # Main server code
-│   └── apache.rs        # Apache config parser
+│   ├── apache.rs        # Apache config parser
+│   └── admin.rs         # Admin dashboard & authentication
 ├── wolflib/             # Rust library for PHP FFI
 │   └── src/lib.rs
 ├── public/              # Web root directory
