@@ -177,6 +177,8 @@ fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
     s.contains("IncompleteMessage")
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() {
     println!(r#"
@@ -186,9 +188,9 @@ async fn main() {
    \ \/  \/ /| |  | | |    |  __|  \___ \ |  __|  |  _  /  \ \/ /  |  __|  
     \  /\  / | |__| | |____| |     ____) || |____ | | \ \   \  /   | |____ 
      \/  \/   \____/|______|_|    |_____/ |______||_|  \_\   \/    |______|
-                                                                
+                                                                          v{}                                                    
  (C)2025 Wolf Software Systems Ltd - http://wolf.uk.com
-"#);
+"#, VERSION);
 
     tracing_subscriber::fmt::init();
 
@@ -644,7 +646,7 @@ async fn handle_php_cgi(state: Arc<AppState>, req: Request, script_path: PathBuf
        .env("SCRIPT_FILENAME", script_filename)
        .env("SCRIPT_NAME", req.uri().path())
        .env("REQUEST_METHOD", req.method().as_str())
-       .env("SERVER_SOFTWARE", "wolfserve/0.1.0")
+       .env("SERVER_SOFTWARE", format!("wolfserve/{}", VERSION))
        .env("REMOTE_ADDR", "127.0.0.1")
        .env("SERVER_PROTOCOL", "HTTP/1.1");
        
@@ -745,7 +747,7 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
     params.insert(Cow::Borrowed("SCRIPT_NAME"), Cow::Owned(parts.uri.path().to_string()));
     params.insert(Cow::Borrowed("REQUEST_URI"), Cow::Owned(parts.uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_else(|| parts.uri.path().to_string())));
     params.insert(Cow::Borrowed("QUERY_STRING"), Cow::Owned(parts.uri.query().unwrap_or("").to_string()));
-    params.insert(Cow::Borrowed("SERVER_SOFTWARE"), Cow::Borrowed("wolfserve/0.1.0"));
+    params.insert(Cow::Borrowed("SERVER_SOFTWARE"), Cow::Owned(format!("wolfserve/{}", VERSION)));
     params.insert(Cow::Borrowed("SERVER_PROTOCOL"), Cow::Borrowed("HTTP/1.1"));
     params.insert(Cow::Borrowed("GATEWAY_INTERFACE"), Cow::Borrowed("CGI/1.1"));
     
