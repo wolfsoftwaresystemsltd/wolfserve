@@ -101,6 +101,7 @@ port = 3000
 
 [php]
 fpm_address = "127.0.0.1:9993"
+session_save_path = "/mnt/shared/wolfserve/sessions"
 
 [apache]
 # Load existing Apache vhost configs
@@ -108,6 +109,66 @@ fpm_address = "127.0.0.1:9993"
 # Fedora/RHEL:   "/etc/httpd"
 config_dir = "/etc/apache2"
 ```
+
+## 🌐 Multi-Server PHP Sessions
+
+WolfServe supports shared PHP sessions across multiple servers, enabling seamless load balancing without sticky sessions.
+
+### Configuration
+
+Set `session_save_path` in `wolfserve.toml` to a shared network location:
+
+```toml
+[php]
+fpm_address = "127.0.0.1:9993"
+session_save_path = "/mnt/shared/wolfserve/sessions"
+```
+
+### How It Works
+
+1. User logs in on **Server A** → session file created at `/mnt/shared/wolfserve/sessions/sess_abc123`
+2. Next request routed to **Server B** → reads the same session file from shared storage
+3. User stays logged in seamlessly across all servers
+
+### Requirements
+
+- All servers must mount the same shared storage (NFS, GlusterFS, Ceph, etc.)
+- Clocks should be synchronized (NTP) for consistent session expiry
+- The installer automatically sets correct permissions (`chmod 1733` with sticky bit)
+
+### Interactive Installation
+
+The service installer prompts for all configuration options:
+
+```bash
+sudo ./install_service.sh
+
+📝 Configuration Options (press Enter to accept defaults)
+
+Server bind address [0.0.0.0]: 
+Server port [3000]: 
+PHP-FPM port [9993]: 
+PHP session save path [/var/lib/php/sessions]: /mnt/shared/wolfserve/sessions
+Apache config directory [/etc/apache2]: 
+```
+
+### Non-Interactive Installation
+
+Use environment variables for automated deployments:
+
+```bash
+sudo WOLFSERVE_SESSION_PATH="/mnt/shared/wolfserve/sessions" \
+     WOLFSERVE_PORT="3000" \
+     ./install_service.sh -y
+```
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `WOLFSERVE_HOST` | Server bind address | `0.0.0.0` |
+| `WOLFSERVE_PORT` | Server port | `3000` |
+| `WOLFSERVE_FPM_PORT` | PHP-FPM port | `9993` |
+| `WOLFSERVE_SESSION_PATH` | PHP session save path | `/var/lib/php/sessions` |
+| `WOLFSERVE_APACHE_DIR` | Apache config directory | `/etc/apache2` |
 
 ## 📁 Project Structure
 
@@ -190,7 +251,7 @@ sudo systemctl status wolfserve
 
 - **SELinux (Fedora/RHEL)**: The installer automatically configures SELinux permissions.
 
-- **PHP Sessions**: The installer sets up `/var/lib/php/sessions` with correct permissions.
+- **PHP Sessions**: For single-server setups, sessions are stored in `/var/lib/php/sessions`. For multi-server deployments, configure `session_save_path` to point to shared storage (see [Multi-Server PHP Sessions](#-multi-server-php-sessions)).
 
 ## 🏗️ Building from Source
 

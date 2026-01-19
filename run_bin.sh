@@ -31,6 +31,22 @@ trap cleanup INT TERM
 
 echo "Starting WolfServe Environment..."
 
+# Read session_save_path from wolfserve.toml config (defaults to /tmp if not found)
+SESSION_SAVE_PATH="/tmp"
+if [ -f "wolfserve.toml" ]; then
+    CONFIGURED_PATH=$(grep -E "^session_save_path\s*=" wolfserve.toml | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d ' ')
+    if [ -n "$CONFIGURED_PATH" ]; then
+        SESSION_SAVE_PATH="$CONFIGURED_PATH"
+        # Create session directory if it doesn't exist
+        if [ ! -d "$SESSION_SAVE_PATH" ]; then
+            echo "Creating session directory: $SESSION_SAVE_PATH"
+            mkdir -p "$SESSION_SAVE_PATH"
+            chmod 1733 "$SESSION_SAVE_PATH"
+        fi
+    fi
+fi
+echo "PHP session save path: $SESSION_SAVE_PATH"
+
 # 1. Start PHP-FPM
 # Check if port 9993 is already in use
 if command -v lsof >/dev/null 2>&1 && lsof -i :9993 >/dev/null 2>&1; then
@@ -57,6 +73,7 @@ php_admin_value[upload_max_filesize] = 256M
 php_admin_value[post_max_size] = 256M
 php_admin_value[upload_tmp_dir] = /tmp
 php_admin_value[max_file_uploads] = 20
+php_admin_value[session.save_path] = ${SESSION_SAVE_PATH:-/tmp}
 EOF
 
     # Find the fpm binary

@@ -145,6 +145,10 @@ struct PhpConfig {
     mode: String, // "fpm" or "cgi"
     #[serde(default = "default_cgi_path")]
     cgi_path: String,
+    /// PHP session save path (e.g., "/mnt/shared/wolfserve/sessions")
+    /// Used by shell scripts for PHP-FPM configuration
+    #[allow(dead_code)]
+    session_save_path: Option<String>,
 }
 
 fn default_php_mode() -> String {
