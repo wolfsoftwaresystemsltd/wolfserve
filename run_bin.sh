@@ -3,22 +3,6 @@
 # Add common sbin folders to PATH for PHP-FPM
 export PATH="$PATH:/usr/sbin:/usr/local/sbin"
 
-# Function to checking required commands
-check_command() {
-    if ! command -v "$1" > /dev/null 2>&1; then
-        # Try sbin for PHP-FPM specifically
-        if [ "$1" = "php-fpm" ]; then
-            if [ -f "/usr/sbin/php-fpm" ] || [ -f "/usr/sbin/php-fpm8.3" ] || [ -f "/usr/sbin/php-fpm8.2" ] || [ -f "/usr/sbin/php-fpm8.1" ]; then
-                return 0
-            fi
-        fi
-        echo "Error: $1 is required but not installed."
-        exit 1
-    fi
-}
-
-check_command php-fpm
-
 # Cleanup function to kill background processes on script exit
 cleanup() {
     echo "Stopping servers..."
