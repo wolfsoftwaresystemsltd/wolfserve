@@ -851,7 +851,13 @@ fn parse_php_response(stdout: Vec<u8>) -> Response {
                     } else {
                         if let Ok(hname) = axum::http::header::HeaderName::from_bytes(key.as_bytes()) {
                             if let Ok(hval) = axum::http::header::HeaderValue::from_str(value) {
-                                headers.insert(hname, hval);
+                                // Use append for Set-Cookie to allow multiple cookies
+                                // (insert would replace previous values)
+                                if hname == axum::http::header::SET_COOKIE {
+                                    headers.append(hname, hval);
+                                } else {
+                                    headers.insert(hname, hval);
+                                }
                             }
                         }
                     }
