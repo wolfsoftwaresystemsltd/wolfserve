@@ -2,6 +2,12 @@
 name = "wolfserve"
 version = "0.2.2"
 edition = "2021"
+license = "MIT"
+description = "A high-performance web server written in Rust that serves PHP applications via FastCGI"
+repository = "https://github.com/yourusername/wolfserve"
+homepage = "https://github.com/yourusername/wolfserve"
+keywords = ["web-server", "php", "fastcgi", "ssl", "http"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "http1", "http2"] }

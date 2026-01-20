@@ -33,4 +33,6 @@ Thumbs.db
 # Release packages
 release-package/
 *.tar.gz
-copyfiles
+
+# Admin data files
+wolfserve_admin.dat

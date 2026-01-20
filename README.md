@@ -2,7 +2,7 @@
 
 A high-performance web server written in Rust that serves PHP applications via FastCGI with native SSL/TLS support and Apache configuration compatibility.
 
-[![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
 ## ✨ Features
@@ -281,7 +281,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📄 License
 
-This project is licensed under the WolfServe Non-Commercial License - see the [LICENSE](LICENSE) file for details. Commercial use requires a separate license.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. You are free to use, modify, and distribute this software for both commercial and non-commercial purposes.
 
 ## 🙏 Acknowledgments
 
