@@ -1,6 +1,7 @@
 # 🐺 WolfServe
 
 [![Support on Patreon](https://img.shields.io/badge/Patreon-Support%20Us-FF424D?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/15362110/join)
+[![Join our Discord](https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/q9qMjHjUQY)
 
 A high-performance web server written in Rust that serves PHP applications via FastCGI with native SSL/TLS support and Apache configuration compatibility.
 
