@@ -1,0 +1,100 @@
+# Auto-close pull requests from anyone who isn't a member of the org
+# (or doesn't have write/maintain/admin on this specific repo).
+#
+# Why: WolfStack ships under a defined commercial-licence model and we
+# don't accept external code contributions — every change is reviewed
+# and signed off by Wolf Software Systems Ltd staff. Without this
+# workflow, the inbox fills with low-quality / regex-scanner / AI-spam
+# PRs that have to be triaged manually (the cy701 attempt on 2026-05-15
+# being the prompt for this guard). Bug reports and feature requests
+# are still welcome via the issue tracker.
+#
+# Uses pull_request_target so it runs in the BASE repo's context
+# (with permission to comment + close), not the fork's context. This
+# is important: pull_request from a fork wouldn't have write perms.
+
+name: Close external PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  close-if-external:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check author and close if external
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+            const prNumber = context.payload.pull_request.number;
+
+            // Allowlist: bots we run ourselves (renovate / dependabot / etc.).
+            // Add bot logins here if we adopt one — the check is exact-match
+            // so this list intentionally stays small.
+            const allowedBots = new Set(['dependabot[bot]', 'renovate[bot]']);
+            if (allowedBots.has(author)) {
+              core.info(`PR #${prNumber} from ${author} — allowed bot, leaving open`);
+              return;
+            }
+
+            // Check the author's permission level on THIS repo. Anyone with
+            // write/maintain/admin is a trusted collaborator and can land PRs.
+            // Returns 'none' if the user isn't a collaborator at all.
+            let perm = 'none';
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author,
+              });
+              perm = data.permission;
+            } catch (e) {
+              // 404 means "not a collaborator" — treat as external.
+              core.info(`Could not fetch permission for ${author}: ${e.message}`);
+            }
+
+            const trusted = ['admin', 'maintain', 'write'];
+            if (trusted.includes(perm)) {
+              core.info(`PR #${prNumber} from ${author} (${perm}) — trusted, leaving open`);
+              return;
+            }
+
+            const body = [
+              `Hi @${author} — thanks for your interest in WolfStack.`,
+              ``,
+              `This repository is the source of a commercially-licensed product `,
+              `from Wolf Software Systems Ltd. We do not accept external pull requests; `,
+              `all changes are reviewed and authored in-house.`,
+              ``,
+              `If you've spotted a bug, found a security issue, or want to suggest `,
+              `a feature, please open an [issue](../../issues) instead — those are `,
+              `read and triaged by the team.`,
+              ``,
+              `For security reports specifically: please use private disclosure via `,
+              `paul@wolf.uk.com rather than a public PR or issue.`,
+              ``,
+              `This PR will be closed automatically. The action is not personal — `,
+              `the same policy applies to every external submitter.`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              state: 'closed',
+            });
+
+            core.info(`Closed PR #${prNumber} from ${author} (permission: ${perm})`);
