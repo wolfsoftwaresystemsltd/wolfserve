@@ -26,6 +26,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tower_http::compression::CompressionLayer;
 use chrono::Utc;
+use percent_encoding::percent_decode_str;
 
 mod apache;
 mod admin;
@@ -371,9 +372,21 @@ config_dir = "/etc/apache2"
 }
 
 
+/// Percent-decode a URL path into its on-disk form (e.g. "%20" -> " "). Browsers percent-encode
+/// reserved characters in the request line, but the filesystem stores the literal name, so any
+/// path with a space (or other encoded byte) must be decoded before we touch disk — otherwise
+/// "uploads/Luton%204.jpg" is looked up verbatim and 404s. Uses lossy UTF-8 so it never panics on
+/// malformed input; callers still guard the result against ".." traversal.
+fn percent_decode_path(path: &str) -> String {
+    percent_decode_str(path).decode_utf8_lossy().into_owned()
+}
+
 async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request) -> Response {
     let start_time = Instant::now();
     let uri_path = req.uri().path().to_string();
+    // Decoded form used for ALL filesystem access. uri_path stays raw (encoded) for logging,
+    // REQUEST_URI and rewrite/redirect matching, which conventionally operate on the raw path.
+    let decoded_uri_path = percent_decode_path(&uri_path);
     let query_string = req.uri().query().unwrap_or("").to_string();
     let method = req.method().to_string();
     
@@ -395,8 +408,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         .unwrap_or("")
         .to_string();
     
-    // Safety: prevent traversing up
-    let clean_path = uri_path.trim_start_matches('/');
+    // Safety: prevent traversing up. Check the DECODED path so an encoded "%2e%2e" cannot slip
+    // past this guard and reach the filesystem as "..".
+    let clean_path = decoded_uri_path.trim_start_matches('/');
     if clean_path.contains("..") {
         let response = (StatusCode::FORBIDDEN, "Forbidden").into_response();
         log_request(&state, &method, &uri_path, 403, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
@@ -489,9 +503,12 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         }
     }
 
-    // Use the rewritten path
+    // Use the rewritten path. Decode it for filesystem access — a no-op for server-side rewrite
+    // targets like "index.php", and the real decoder when no rewrite applied and this is still
+    // the raw URL path.
     let clean_rewritten = rewritten_path.trim_start_matches('/');
-    let mut path = doc_root.join(clean_rewritten);
+    let decoded_rewritten = percent_decode_path(clean_rewritten);
+    let mut path = doc_root.join(&decoded_rewritten);
 
     // Resolve directory index
     if path.is_dir() {
@@ -872,4 +889,32 @@ fn parse_php_response(stdout: Vec<u8>) -> Response {
     };
 
     (status_code, headers, body_data).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode_path;
+
+    #[test]
+    fn decodes_spaces_so_static_files_resolve() {
+        // The bug: spaced uploads 404'd because "%20" was never decoded before disk lookup.
+        assert_eq!(percent_decode_path("/uploads/Luton%204.jpg"), "/uploads/Luton 4.jpg");
+        assert_eq!(
+            percent_decode_path("/uploads/WhatsApp%20Image%202026-04-24%20at%2009.05.48.jpeg"),
+            "/uploads/WhatsApp Image 2026-04-24 at 09.05.48.jpeg"
+        );
+    }
+
+    #[test]
+    fn plain_paths_are_unchanged() {
+        assert_eq!(percent_decode_path("/uploads/i2mage.png"), "/uploads/i2mage.png");
+        assert_eq!(percent_decode_path("/index.php"), "/index.php");
+    }
+
+    #[test]
+    fn encoded_traversal_is_revealed_for_the_dotdot_guard() {
+        // Decoding must happen BEFORE the ".." check so encoded traversal can't slip through.
+        let decoded = percent_decode_path("/%2e%2e/%2e%2e/etc/passwd");
+        assert!(decoded.contains(".."), "decoded form must expose '..' to the guard: {decoded}");
+    }
 }

@@ -1819,6 +1819,7 @@ dependencies = [
  "hyper-util",
  "mime_guess",
  "parking_lot",
+ "percent-encoding",
  "regex",
  "rustls",
  "rustls-pemfile",

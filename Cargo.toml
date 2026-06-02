@@ -33,6 +33,7 @@ rustls-pemfile = "2"
 futures-util = "0.3"
 hyper-util = { version = "0.1.19", features = ["full"] }
 regex = "1"
+percent-encoding = "2"
 bcrypt = "0.15"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
