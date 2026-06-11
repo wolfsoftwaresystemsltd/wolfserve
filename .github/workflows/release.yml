@@ -1,0 +1,181 @@
+name: Build Release Binaries
+
+# Mirrors the pattern used by the WolfStack repo: every push to main
+# that touches the crate or the workflow itself rebuilds static musl
+# binaries for x86_64 and aarch64, signs them via cosign keyless OIDC,
+# and creates / updates the GitHub release tagged after the version in
+# Cargo.toml.
+#
+# setup.sh then downloads the matching binary instead of cargo-building
+# on the operator's box, which removes the rustup-toolchain / build-
+# deps surface as a failure mode.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'src/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            runner: ubuntu-latest
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build static binary
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Get version
+        id: version
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/wolfserve dist/wolfserve-${{ matrix.arch }}
+          chmod +x dist/wolfserve-${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: wolfserve-${{ matrix.arch }}
+          path: dist/wolfserve-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # gh release create
+      id-token: write       # cosign keyless OIDC + attest provenance
+      attestations: write   # actions/attest-build-provenance
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum wolfserve-x86_64 wolfserve-aarch64 > SHA256SUMS
+
+      - name: Generate build-provenance attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/wolfserve-x86_64
+            dist/wolfserve-aarch64
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign binaries with cosign (keyless)
+        # Keyless OIDC — signing identity is this workflow, anchored
+        # to the GitHub Actions OIDC token. Verifiers walk the cert
+        # chain back to Sigstore's Fulcio CA + Rekor transparency log.
+        run: |
+          cd dist
+          for f in wolfserve-x86_64 wolfserve-aarch64; do
+            cosign sign-blob --yes \
+              --bundle "${f}.cosign.bundle" \
+              "$f"
+          done
+
+      - name: Generate release notes from release-commit body
+        id: notes
+        run: |
+          BODY=$(git log -50 --grep='^v[0-9]' -1 --pretty=format:'%b' || echo "")
+          SUBJECT=$(git log -50 --grep='^v[0-9]' -1 --pretty=format:'%s' || echo "Release")
+
+          {
+            echo "## $SUBJECT"
+            echo
+            if [ -n "$BODY" ]; then
+              echo "$BODY"
+              echo
+            fi
+            cat <<'EOF'
+          ---
+
+          ## Verifying this release
+
+          Each binary is signed via [cosign](https://docs.sigstore.dev/) keyless OIDC and ships with a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance) attestation.
+
+          **Verify the cosign signature:**
+          ```
+          cosign verify-blob \
+            --bundle wolfserve-x86_64.cosign.bundle \
+            --certificate-identity-regexp 'https://github.com/wolfsoftwaresystemsltd/wolfserve/\.github/workflows/release\.yml@.*' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            wolfserve-x86_64
+          ```
+
+          **Verify the build provenance:**
+          ```
+          gh attestation verify wolfserve-x86_64 --repo wolfsoftwaresystemsltd/wolfserve
+          ```
+
+          **Verify the SHA-256 checksum:**
+          ```
+          sha256sum -c SHA256SUMS
+          ```
+
+          ## Artifacts
+
+          - `wolfserve-x86_64` / `wolfserve-aarch64` — static musl binaries (Linux x86_64 and ARM64).
+          - `wolfserve-<arch>.cosign.bundle` — cosign signature bundle (cert + signature + Rekor entry).
+          - `SHA256SUMS` — checksums for both binaries.
+          EOF
+          } > release-notes.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="v${{ steps.version.outputs.version }}"
+
+          gh release delete "$VERSION" --yes 2>/dev/null || true
+          git push --delete origin "$VERSION" 2>/dev/null || true
+          git tag -d "$VERSION" 2>/dev/null || true
+
+          gh release create "$VERSION" \
+            --target main \
+            --title "WolfServe $VERSION" \
+            --notes-file release-notes.md \
+            dist/wolfserve-x86_64 \
+            dist/wolfserve-x86_64.cosign.bundle \
+            dist/wolfserve-aarch64 \
+            dist/wolfserve-aarch64.cosign.bundle \
+            dist/SHA256SUMS

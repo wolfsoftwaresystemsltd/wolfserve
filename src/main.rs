@@ -181,6 +181,71 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() {
+    // CLI args FIRST — `wolfserve --version` / `--test` must never start a
+    // server or write a default config. (The wolfproxy v0.4.7 lesson:
+    // WolfStack's component probes ran the full server and orphaned a
+    // listener holding the ports.)
+    let args: Vec<String> = std::env::args().collect();
+    let mut config_path = String::from("wolfserve.toml");
+    let mut test_only = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--version" | "-V" => {
+                println!("wolfserve {}", VERSION);
+                return;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "wolfserve {}\n\nUsage: wolfserve [OPTIONS]\n\nOptions:\n  -c, --config <path>  Config file (default: ./wolfserve.toml)\n  -t, --test           Validate config + Apache vhosts, then exit\n  -V, --version        Print version\n  -h, --help           Show this help",
+                    VERSION
+                );
+                return;
+            }
+            "--test" | "-t" => test_only = true,
+            "--config" | "-c" => {
+                if i + 1 >= args.len() {
+                    eprintln!("wolfserve: --config needs a path");
+                    std::process::exit(2);
+                }
+                config_path = args[i + 1].clone();
+                i += 1;
+            }
+            other => {
+                eprintln!("wolfserve: unknown argument '{}' (try --help)", other);
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    if test_only {
+        // Validate-and-exit: read the config WITHOUT creating a default
+        // (a probe must not litter the cwd), parse it, and walk the
+        // Apache vhost dir the way startup would.
+        let config_str = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("wolfserve: cannot read {}: {}", config_path, e);
+                std::process::exit(1);
+            }
+        };
+        let config: Config = match toml::from_str(&config_str) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wolfserve: config parse error in {}: {}", config_path, e);
+                std::process::exit(1);
+            }
+        };
+        let vhosts = apache::load_apache_config(Path::new(&config.apache.config_dir));
+        println!(
+            "wolfserve: configuration OK — {} vhost(s) from {}",
+            vhosts.len(),
+            config.apache.config_dir
+        );
+        return;
+    }
+
     println!(r#"
  __          ______  _      ______  _____  ______  _____ __      __ ______ 
  \ \        / / __ \| |    |  ____|/ ____||  ____||  __ \\ \    / /|  ____|
@@ -195,10 +260,10 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Load configuration
-    let config_str = match fs::read_to_string("wolfserve.toml").await {
+    let config_str = match fs::read_to_string(&config_path).await {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("Configuration file 'wolfserve.toml' not found. Creating default.");
+            eprintln!("Configuration file '{}' not found. Creating default.", config_path);
             let default_config = r#"
 [server]
 host = "0.0.0.0"
@@ -210,7 +275,7 @@ fpm_address = "127.0.0.1:9993"
 [apache]
 config_dir = "/etc/apache2"
 "#;
-            fs::write("wolfserve.toml", default_config).await.unwrap();
+            fs::write(&config_path, default_config).await.unwrap();
             default_config.to_string()
         }
     };
