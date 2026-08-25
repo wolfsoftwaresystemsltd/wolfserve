@@ -1036,12 +1036,32 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
         }
     }
     
-    // Handle headers
+    // Handle headers.
+    //
+    // [FIX 2026-08-25] A repeated header must be RECOMBINED into one FastCGI param, not
+    // overwritten. `params.insert` replaced any earlier value for the same key, so when a
+    // client sent a header more than once only the LAST occurrence reached PHP. This bit
+    // Cookie hardest: under HTTP/2 (which we now negotiate) clients are encouraged to split
+    // the cookie list into several `cookie` header fields (RFC 7540 §8.1.2.5), and Chromium
+    // does exactly that — so PHP received only the last field and dropped PHPSESSID, logging
+    // the user out on every click. Firefox sends a single `cookie` field, which is why it was
+    // unaffected. RFC 3875 §4.1.18 requires repeated headers be joined with ", ", except the
+    // Cookie header, whose own grammar joins with "; ".
+    let mut header_params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (name, value) in parts.headers.iter() {
+        let Ok(val) = value.to_str() else { continue };
         let key = format!("HTTP_{}", name.as_str().replace('-', "_").to_uppercase());
-        if let Ok(val) = value.to_str() {
-             params.insert(Cow::Owned(key), Cow::Owned(val.to_string()));
-        }
+        let sep = if name == axum::http::header::COOKIE { "; " } else { ", " };
+        header_params
+            .entry(key)
+            .and_modify(|existing| {
+                existing.push_str(sep);
+                existing.push_str(val);
+            })
+            .or_insert_with(|| val.to_string());
+    }
+    for (key, val) in header_params {
+        params.insert(Cow::Owned(key), Cow::Owned(val));
     }
     
     // Content Headers
