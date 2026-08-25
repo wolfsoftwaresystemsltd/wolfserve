@@ -317,9 +317,29 @@ config_dir = "/etc/apache2"
             certs: ssl_certs,
             default_cert: default_ssl_cert,
         });
-        let tls_config = Arc::new(rustls::ServerConfig::builder()
+        let mut tls_config_inner = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_cert_resolver(resolver));
+            .with_cert_resolver(resolver);
+        // Advertise HTTP/2 via ALPN.
+        //
+        // `hyper_util::server::conn::auto::Builder` below already serves h2 or HTTP/1.1
+        // depending on what the connection turns out to be — but over TLS a browser only
+        // ever speaks h2 when the server SELECTS it during the handshake (RFC 7301; RFC
+        // 9113 s3.3 makes ALPN the sole negotiation mechanism for HTTP/2 over TLS). With
+        // no `alpn_protocols` rustls negotiates nothing, so every client fell back to
+        // HTTP/1.1 and was capped at ~6 connections per origin.
+        //
+        // That cap is the second half of the slow-load problem measured on 2026-08-25:
+        // the WolfStorm viewer pulls 193 script files, which at 6-way parallelism is ~33
+        // serialised round trips before the app can start. h2 multiplexes them over one
+        // connection.
+        //
+        // Order is preference order — h2 first, with http/1.1 retained so any client that
+        // does not offer h2 is unaffected. Safe here because wolfserve serves no WebSocket
+        // endpoints (WebSockets over h2 need Extended CONNECT, which hyper does not do by
+        // default); verified by grep before enabling.
+        tls_config_inner.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls_config = Arc::new(tls_config_inner);
             
         for port in https_ports {
             let addr: SocketAddr = format!("{}:{}", host_ip, port).parse().unwrap();
@@ -550,7 +570,7 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     }
 
     // Serve static file
-    let response = serve_static_file(path).await;
+    let response = serve_static_file(path, &headers, &query_string).await;
     let status = response.status().as_u16();
     log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
     response
@@ -631,14 +651,138 @@ fn handle_redirect(status_code: u16, target: Option<String>) -> Response {
     }
 }
 
-async fn serve_static_file(path: PathBuf) -> Response {
+/// Format a SystemTime as an HTTP IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+///
+/// Source: RFC 9110 s5.6.7 — "An HTTP-date value represents time as an instance of
+/// Coordinated Universal Time (UTC) [...] preferred format is a fixed-length subset of
+/// the format defined in RFC 5322", and senders MUST use IMF-fixdate. chrono formats
+/// day/month names in English regardless of locale, which is what the grammar requires.
+fn http_date(t: std::time::SystemTime) -> Option<String> {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let dt = chrono::DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, 0)?;
+    Some(dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+}
+
+/// Parse an HTTP IMF-fixdate back to whole seconds since the epoch.
+///
+/// Only IMF-fixdate is accepted. RFC 9110 s5.6.7 also lists two obsolete formats that a
+/// recipient MUST accept, but they appear only from pre-1995 clients; failing to parse
+/// simply means we skip the 304 and send the body, which is always correct if wasteful.
+fn parse_http_date(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+/// Does an `If-None-Match` field value match our entity tag?
+///
+/// Source: RFC 9110 s13.1.2 — the value is `*` or a comma-separated list of entity tags,
+/// compared with the WEAK comparison function for If-None-Match. Weak comparison ignores
+/// the `W/` prefix, so we strip it from both sides before comparing opaque tags.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").trim().to_string();
+    if header.trim() == "*" {
+        return true;
+    }
+    let ours = strip(etag);
+    header.split(',').any(|candidate| strip(candidate) == ours)
+}
+
+/// Serve a file from disk with cache validators and a conditional-request fast path.
+///
+/// WHY THIS EXISTS (measured 2026-08-25): wolfserve previously sent ONLY `Content-Type`.
+/// With no `ETag`, no `Last-Modified` and no `Cache-Control`, a browser cannot revalidate
+/// and cannot even apply heuristic freshness (RFC 9111 s4.2.2 needs `Last-Modified` to
+/// compute one), so every visit re-downloaded every asset. For the WolfStorm viewer that
+/// is 193 script files, 2.28 MB gzipped, measured at 7.33 s on a fast wired link — and it
+/// was the single largest contributor to users on slow connections concluding the viewer
+/// was broken when it was merely still loading.
+///
+/// CACHE POLICY, and why it is deliberately conservative:
+///   * A URL carrying the `_cb=` content token is immutable — index.php derives that token
+///     from the newest mtime across js/, css/ and icons/, so ANY deploy produces new URLs.
+///     A stale copy can therefore never be served for a token that is still in use, which
+///     is the precondition RFC 8246 requires before `immutable` is safe.
+///   * Everything else gets `max-age=0, must-revalidate`: always revalidate, but answer
+///     with a 304 instead of the body. That cannot serve anything stale under any
+///     circumstance, and still removes the payload from the common case.
+///
+/// This deliberately does NOT introduce any freshness lifetime for un-tokened URLs. The
+/// grid has been bitten before by content pinned in a cache with no user-side recovery
+/// (a service worker froze users on a January build for seven months), and an HTTP cache
+/// entry is just as unreachable. Revalidation is cheap; staleness is not.
+async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query_string: &str) -> Response {
+    use axum::http::header;
+
+    let metadata = match fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
+    };
+
+    let modified = metadata.modified().ok();
+    let last_modified = modified.and_then(http_date);
+
+    // Entity tag from mtime + size, the same inputs Apache's FileETag MTime+Size uses.
+    // Quoted because RFC 9110 s8.8.3 defines entity-tag as a quoted opaque string.
+    let etag = modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format!("\"{:x}-{:x}\"", d.as_secs(), metadata.len()));
+
+    // A `_cb=` token means the URL is content-addressed: see the policy note above.
+    let is_content_tokened = query_string
+        .split('&')
+        .any(|pair| pair.starts_with("_cb=") && pair.len() > 4);
+    let cache_control = if is_content_tokened {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    };
+
+    // --- Conditional request handling -------------------------------------------------
+    // Source: RFC 9110 s13.2.2 — If-None-Match takes precedence; a recipient MUST ignore
+    // If-Modified-Since when If-None-Match is present.
+    let mut not_modified = false;
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        if let Some(ref tag) = etag {
+            not_modified = if_none_match_matches(inm, tag);
+        }
+    } else if let Some(ims) = headers.get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()) {
+        if let (Some(since), Some(m)) = (parse_http_date(ims), modified) {
+            if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                // Whole-second granularity: not modified when mtime <= the supplied date.
+                not_modified = (d.as_secs() as i64) <= since;
+            }
+        }
+    }
+
+    // Source: RFC 9110 s15.4.5 — a 304 MUST include the validators that would have been
+    // sent on a 200, and carries no body.
+    let mut builder = Response::builder();
+    if let Some(ref tag) = etag {
+        builder = builder.header(header::ETAG, tag.clone());
+    }
+    if let Some(ref lm) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm.clone());
+    }
+    builder = builder.header(header::CACHE_CONTROL, cache_control);
+
+    if not_modified {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_response();
+    }
+
     match fs::read(&path).await {
         Ok(content) => {
             let mime_type = mime_guess::from_path(&path).first_or_text_plain();
-            (
-                [(axum::http::header::CONTENT_TYPE, mime_type.to_string())],
-                content,
-            ).into_response()
+            builder
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime_type.to_string())
+                .body(axum::body::Body::from(content))
+                .unwrap()
+                .into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
     }
