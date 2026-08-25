@@ -711,6 +711,40 @@ fn if_none_match_matches(header: &str, etag: &str) -> bool {
 /// grid has been bitten before by content pinned in a cache with no user-side recovery
 /// (a service worker froze users on a January build for seven months), and an HTTP cache
 /// entry is just as unreachable. Revalidation is cheap; staleness is not.
+/// Does this Accept-Encoding header genuinely accept Brotli?
+///
+/// Deliberately not a substring search for "br": that misses the `q=0` case, which is a
+/// client explicitly REFUSING the encoding (RFC 9110 s12.5.3 — "a qvalue of 0 means the
+/// content-coding is not acceptable"). Serving br to a client that sent `br;q=0` is a
+/// broken page, not a slow one.
+fn accepts_brotli(headers: &axum::http::HeaderMap) -> bool {
+    let raw = match headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    for part in raw.split(',') {
+        let mut it = part.split(';');
+        let token = it.next().unwrap_or("").trim();
+        if !token.eq_ignore_ascii_case("br") {
+            continue;
+        }
+        for param in it {
+            let param = param.trim();
+            let lower = param.to_ascii_lowercase();
+            if let Some(q) = lower.strip_prefix("q=") {
+                if q.trim().parse::<f32>().map(|n| n <= 0.0).unwrap_or(false) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
 async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query_string: &str) -> Response {
     use axum::http::header;
 
@@ -718,6 +752,55 @@ async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query
         Ok(m) => m,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
     };
+
+    // ── Precompressed Brotli ──────────────────────────────────────────────────────────
+    //
+    // WHY (measured 2026-08-25 against this server): the router's CompressionLayer is
+    // `CompressionLayer::new()` — DEFAULT quality, which for Brotli is q4. Across the 200 JS
+    // files the viewer loads, q4 Brotli totals 2,593,647 bytes against gzip's 2,562,877, so
+    // Brotli was actually LOSING to gzip in aggregate while Chrome preferred it. Brotli q11
+    // totals 2,117,277 bytes: 446 KB and 17.4% off every cold load.
+    //
+    // q11 cannot be done per request — it is far slower than q4 and would move the cost from
+    // the network onto the CPU on every hit. So it is done once, ahead of time, and served
+    // from a `.br` sibling. This is the same mechanism tower-http's ServeDir calls
+    // `precompressed_br`; this server has its own static handler, so it needs its own.
+    //
+    // STALENESS IS THE FAILURE MODE THAT MATTERS. A `.br` left behind by an older deploy would
+    // serve OLD JAVASCRIPT to every Brotli-capable client while the plain file looked correct,
+    // which is near-undiagnosable from the outside — and this project has been bitten by
+    // exactly that shape before (a service worker pinned users to a January build for seven
+    // months). So the `.br` is used ONLY when its mtime is >= the source's. Otherwise it is
+    // ignored and the layer compresses the fresh original.
+    //
+    // tower-http skips any response that already carries Content-Encoding
+    // (compression/future.rs:43), so this body is not re-compressed. It also appends
+    // `Vary: accept-encoding` ONLY when it actually compresses (future.rs:53) — which is why
+    // this path must set Vary itself, or a shared cache could hand the Brotli bytes to a
+    // client that never asked for them.
+    let mut serve_path = path.clone();
+    let mut serve_meta = metadata.clone();
+    let mut is_br = false;
+    if accepts_brotli(headers) {
+        let mut br_os = path.clone().into_os_string();
+        br_os.push(".br");
+        let br_path = PathBuf::from(br_os);
+        if let Ok(br_meta) = fs::metadata(&br_path).await {
+            let fresh = match (br_meta.modified(), metadata.modified()) {
+                (Ok(b), Ok(s)) => b >= s,
+                _ => false,
+            };
+            if fresh && br_meta.len() > 0 {
+                serve_path = br_path;
+                serve_meta = br_meta;
+                is_br = true;
+            }
+        }
+    }
+    // Validators must describe the representation actually sent, or a client switching
+    // encodings could be handed a 304 for bytes it does not have (RFC 9110 s8.8.1: an
+    // entity-tag identifies one specific representation).
+    let metadata = serve_meta;
 
     let modified = metadata.modified().ok();
     let last_modified = modified.and_then(http_date);
@@ -765,6 +848,14 @@ async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query
         builder = builder.header(header::LAST_MODIFIED, lm.clone());
     }
     builder = builder.header(header::CACHE_CONTROL, cache_control);
+    if is_br {
+        // Set on the 304 as well as the 200: RFC 9110 s15.4.5 requires a 304 to carry the
+        // header fields that would have been sent on a 200, and a cache that stored the
+        // response without Vary would serve it to clients that cannot decode it.
+        builder = builder
+            .header(header::CONTENT_ENCODING, "br")
+            .header(header::VARY, "accept-encoding");
+    }
 
     if not_modified {
         return builder
@@ -774,8 +865,12 @@ async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query
             .into_response();
     }
 
-    match fs::read(&path).await {
+    match fs::read(&serve_path).await {
         Ok(content) => {
+            // MIME comes from the ORIGINAL path, never from serve_path: `main.js.br` guesses as
+            // application/octet-stream, and a script served with that Content-Type is refused
+            // outright by browsers under X-Content-Type-Options: nosniff. Content-Encoding
+            // describes the transfer coding; Content-Type must still describe the payload.
             let mime_type = mime_guess::from_path(&path).first_or_text_plain();
             builder
                 .status(StatusCode::OK)
