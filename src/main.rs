@@ -26,6 +26,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tower_http::compression::CompressionLayer;
 use chrono::Utc;
+use percent_encoding::percent_decode_str;
 
 mod apache;
 mod admin;
@@ -381,9 +382,29 @@ config_dir = "/etc/apache2"
             certs: ssl_certs,
             default_cert: default_ssl_cert,
         });
-        let tls_config = Arc::new(rustls::ServerConfig::builder()
+        let mut tls_config_inner = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_cert_resolver(resolver));
+            .with_cert_resolver(resolver);
+        // Advertise HTTP/2 via ALPN.
+        //
+        // `hyper_util::server::conn::auto::Builder` below already serves h2 or HTTP/1.1
+        // depending on what the connection turns out to be — but over TLS a browser only
+        // ever speaks h2 when the server SELECTS it during the handshake (RFC 7301; RFC
+        // 9113 s3.3 makes ALPN the sole negotiation mechanism for HTTP/2 over TLS). With
+        // no `alpn_protocols` rustls negotiates nothing, so every client fell back to
+        // HTTP/1.1 and was capped at ~6 connections per origin.
+        //
+        // That cap is the second half of the slow-load problem measured on 2026-08-25:
+        // the WolfStorm viewer pulls 193 script files, which at 6-way parallelism is ~33
+        // serialised round trips before the app can start. h2 multiplexes them over one
+        // connection.
+        //
+        // Order is preference order — h2 first, with http/1.1 retained so any client that
+        // does not offer h2 is unaffected. Safe here because wolfserve serves no WebSocket
+        // endpoints (WebSockets over h2 need Extended CONNECT, which hyper does not do by
+        // default); verified by grep before enabling.
+        tls_config_inner.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls_config = Arc::new(tls_config_inner);
             
         for port in https_ports {
             let addr: SocketAddr = format!("{}:{}", host_ip, port).parse().unwrap();
@@ -436,9 +457,21 @@ config_dir = "/etc/apache2"
 }
 
 
+/// Percent-decode a URL path into its on-disk form (e.g. "%20" -> " "). Browsers percent-encode
+/// reserved characters in the request line, but the filesystem stores the literal name, so any
+/// path with a space (or other encoded byte) must be decoded before we touch disk — otherwise
+/// "uploads/Luton%204.jpg" is looked up verbatim and 404s. Uses lossy UTF-8 so it never panics on
+/// malformed input; callers still guard the result against ".." traversal.
+fn percent_decode_path(path: &str) -> String {
+    percent_decode_str(path).decode_utf8_lossy().into_owned()
+}
+
 async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, req: Request) -> Response {
     let start_time = Instant::now();
     let uri_path = req.uri().path().to_string();
+    // Decoded form used for ALL filesystem access. uri_path stays raw (encoded) for logging,
+    // REQUEST_URI and rewrite/redirect matching, which conventionally operate on the raw path.
+    let decoded_uri_path = percent_decode_path(&uri_path);
     let query_string = req.uri().query().unwrap_or("").to_string();
     let method = req.method().to_string();
     
@@ -460,8 +493,9 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         .unwrap_or("")
         .to_string();
     
-    // Safety: prevent traversing up
-    let clean_path = uri_path.trim_start_matches('/');
+    // Safety: prevent traversing up. Check the DECODED path so an encoded "%2e%2e" cannot slip
+    // past this guard and reach the filesystem as "..".
+    let clean_path = decoded_uri_path.trim_start_matches('/');
     if clean_path.contains("..") {
         let response = (StatusCode::FORBIDDEN, "Forbidden").into_response();
         log_request(&state, &method, &uri_path, 403, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
@@ -554,9 +588,12 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         }
     }
 
-    // Use the rewritten path
+    // Use the rewritten path. Decode it for filesystem access — a no-op for server-side rewrite
+    // targets like "index.php", and the real decoder when no rewrite applied and this is still
+    // the raw URL path.
     let clean_rewritten = rewritten_path.trim_start_matches('/');
-    let mut path = doc_root.join(clean_rewritten);
+    let decoded_rewritten = percent_decode_path(clean_rewritten);
+    let mut path = doc_root.join(&decoded_rewritten);
 
     // Resolve directory index
     if path.is_dir() {
@@ -598,7 +635,7 @@ async fn handle_request(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     }
 
     // Serve static file
-    let response = serve_static_file(path).await;
+    let response = serve_static_file(path, &headers, &query_string).await;
     let status = response.status().as_u16();
     log_request(&state, &method, &uri_path, status, start_time.elapsed().as_millis() as u64, &client_ip, &host_for_log, &user_agent);
     response
@@ -679,14 +716,233 @@ fn handle_redirect(status_code: u16, target: Option<String>) -> Response {
     }
 }
 
-async fn serve_static_file(path: PathBuf) -> Response {
-    match fs::read(&path).await {
+/// Format a SystemTime as an HTTP IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+///
+/// Source: RFC 9110 s5.6.7 — "An HTTP-date value represents time as an instance of
+/// Coordinated Universal Time (UTC) [...] preferred format is a fixed-length subset of
+/// the format defined in RFC 5322", and senders MUST use IMF-fixdate. chrono formats
+/// day/month names in English regardless of locale, which is what the grammar requires.
+fn http_date(t: std::time::SystemTime) -> Option<String> {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let dt = chrono::DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, 0)?;
+    Some(dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+}
+
+/// Parse an HTTP IMF-fixdate back to whole seconds since the epoch.
+///
+/// Only IMF-fixdate is accepted. RFC 9110 s5.6.7 also lists two obsolete formats that a
+/// recipient MUST accept, but they appear only from pre-1995 clients; failing to parse
+/// simply means we skip the 304 and send the body, which is always correct if wasteful.
+fn parse_http_date(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+/// Does an `If-None-Match` field value match our entity tag?
+///
+/// Source: RFC 9110 s13.1.2 — the value is `*` or a comma-separated list of entity tags,
+/// compared with the WEAK comparison function for If-None-Match. Weak comparison ignores
+/// the `W/` prefix, so we strip it from both sides before comparing opaque tags.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").trim().to_string();
+    if header.trim() == "*" {
+        return true;
+    }
+    let ours = strip(etag);
+    header.split(',').any(|candidate| strip(candidate) == ours)
+}
+
+/// Serve a file from disk with cache validators and a conditional-request fast path.
+///
+/// WHY THIS EXISTS (measured 2026-08-25): wolfserve previously sent ONLY `Content-Type`.
+/// With no `ETag`, no `Last-Modified` and no `Cache-Control`, a browser cannot revalidate
+/// and cannot even apply heuristic freshness (RFC 9111 s4.2.2 needs `Last-Modified` to
+/// compute one), so every visit re-downloaded every asset. For the WolfStorm viewer that
+/// is 193 script files, 2.28 MB gzipped, measured at 7.33 s on a fast wired link — and it
+/// was the single largest contributor to users on slow connections concluding the viewer
+/// was broken when it was merely still loading.
+///
+/// CACHE POLICY, and why it is deliberately conservative:
+///   * A URL carrying the `_cb=` content token is immutable — index.php derives that token
+///     from the newest mtime across js/, css/ and icons/, so ANY deploy produces new URLs.
+///     A stale copy can therefore never be served for a token that is still in use, which
+///     is the precondition RFC 8246 requires before `immutable` is safe.
+///   * Everything else gets `max-age=0, must-revalidate`: always revalidate, but answer
+///     with a 304 instead of the body. That cannot serve anything stale under any
+///     circumstance, and still removes the payload from the common case.
+///
+/// This deliberately does NOT introduce any freshness lifetime for un-tokened URLs. The
+/// grid has been bitten before by content pinned in a cache with no user-side recovery
+/// (a service worker froze users on a January build for seven months), and an HTTP cache
+/// entry is just as unreachable. Revalidation is cheap; staleness is not.
+/// Does this Accept-Encoding header genuinely accept Brotli?
+///
+/// Deliberately not a substring search for "br": that misses the `q=0` case, which is a
+/// client explicitly REFUSING the encoding (RFC 9110 s12.5.3 — "a qvalue of 0 means the
+/// content-coding is not acceptable"). Serving br to a client that sent `br;q=0` is a
+/// broken page, not a slow one.
+fn accepts_brotli(headers: &axum::http::HeaderMap) -> bool {
+    let raw = match headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    for part in raw.split(',') {
+        let mut it = part.split(';');
+        let token = it.next().unwrap_or("").trim();
+        if !token.eq_ignore_ascii_case("br") {
+            continue;
+        }
+        for param in it {
+            let param = param.trim();
+            let lower = param.to_ascii_lowercase();
+            if let Some(q) = lower.strip_prefix("q=") {
+                if q.trim().parse::<f32>().map(|n| n <= 0.0).unwrap_or(false) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+async fn serve_static_file(path: PathBuf, headers: &axum::http::HeaderMap, query_string: &str) -> Response {
+    use axum::http::header;
+
+    let metadata = match fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
+    };
+
+    // ── Precompressed Brotli ──────────────────────────────────────────────────────────
+    //
+    // WHY (measured 2026-08-25 against this server): the router's CompressionLayer is
+    // `CompressionLayer::new()` — DEFAULT quality, which for Brotli is q4. Across the 200 JS
+    // files the viewer loads, q4 Brotli totals 2,593,647 bytes against gzip's 2,562,877, so
+    // Brotli was actually LOSING to gzip in aggregate while Chrome preferred it. Brotli q11
+    // totals 2,117,277 bytes: 446 KB and 17.4% off every cold load.
+    //
+    // q11 cannot be done per request — it is far slower than q4 and would move the cost from
+    // the network onto the CPU on every hit. So it is done once, ahead of time, and served
+    // from a `.br` sibling. This is the same mechanism tower-http's ServeDir calls
+    // `precompressed_br`; this server has its own static handler, so it needs its own.
+    //
+    // STALENESS IS THE FAILURE MODE THAT MATTERS. A `.br` left behind by an older deploy would
+    // serve OLD JAVASCRIPT to every Brotli-capable client while the plain file looked correct,
+    // which is near-undiagnosable from the outside — and this project has been bitten by
+    // exactly that shape before (a service worker pinned users to a January build for seven
+    // months). So the `.br` is used ONLY when its mtime is >= the source's. Otherwise it is
+    // ignored and the layer compresses the fresh original.
+    //
+    // tower-http skips any response that already carries Content-Encoding
+    // (compression/future.rs:43), so this body is not re-compressed. It also appends
+    // `Vary: accept-encoding` ONLY when it actually compresses (future.rs:53) — which is why
+    // this path must set Vary itself, or a shared cache could hand the Brotli bytes to a
+    // client that never asked for them.
+    let mut serve_path = path.clone();
+    let mut serve_meta = metadata.clone();
+    let mut is_br = false;
+    if accepts_brotli(headers) {
+        let mut br_os = path.clone().into_os_string();
+        br_os.push(".br");
+        let br_path = PathBuf::from(br_os);
+        if let Ok(br_meta) = fs::metadata(&br_path).await {
+            let fresh = match (br_meta.modified(), metadata.modified()) {
+                (Ok(b), Ok(s)) => b >= s,
+                _ => false,
+            };
+            if fresh && br_meta.len() > 0 {
+                serve_path = br_path;
+                serve_meta = br_meta;
+                is_br = true;
+            }
+        }
+    }
+    // Validators must describe the representation actually sent, or a client switching
+    // encodings could be handed a 304 for bytes it does not have (RFC 9110 s8.8.1: an
+    // entity-tag identifies one specific representation).
+    let metadata = serve_meta;
+
+    let modified = metadata.modified().ok();
+    let last_modified = modified.and_then(http_date);
+
+    // Entity tag from mtime + size, the same inputs Apache's FileETag MTime+Size uses.
+    // Quoted because RFC 9110 s8.8.3 defines entity-tag as a quoted opaque string.
+    let etag = modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format!("\"{:x}-{:x}\"", d.as_secs(), metadata.len()));
+
+    // A `_cb=` token means the URL is content-addressed: see the policy note above.
+    let is_content_tokened = query_string
+        .split('&')
+        .any(|pair| pair.starts_with("_cb=") && pair.len() > 4);
+    let cache_control = if is_content_tokened {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    };
+
+    // --- Conditional request handling -------------------------------------------------
+    // Source: RFC 9110 s13.2.2 — If-None-Match takes precedence; a recipient MUST ignore
+    // If-Modified-Since when If-None-Match is present.
+    let mut not_modified = false;
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        if let Some(ref tag) = etag {
+            not_modified = if_none_match_matches(inm, tag);
+        }
+    } else if let Some(ims) = headers.get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()) {
+        if let (Some(since), Some(m)) = (parse_http_date(ims), modified) {
+            if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                // Whole-second granularity: not modified when mtime <= the supplied date.
+                not_modified = (d.as_secs() as i64) <= since;
+            }
+        }
+    }
+
+    // Source: RFC 9110 s15.4.5 — a 304 MUST include the validators that would have been
+    // sent on a 200, and carries no body.
+    let mut builder = Response::builder();
+    if let Some(ref tag) = etag {
+        builder = builder.header(header::ETAG, tag.clone());
+    }
+    if let Some(ref lm) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm.clone());
+    }
+    builder = builder.header(header::CACHE_CONTROL, cache_control);
+    if is_br {
+        // Set on the 304 as well as the 200: RFC 9110 s15.4.5 requires a 304 to carry the
+        // header fields that would have been sent on a 200, and a cache that stored the
+        // response without Vary would serve it to clients that cannot decode it.
+        builder = builder
+            .header(header::CONTENT_ENCODING, "br")
+            .header(header::VARY, "accept-encoding");
+    }
+
+    if not_modified {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_response();
+    }
+
+    match fs::read(&serve_path).await {
         Ok(content) => {
+            // MIME comes from the ORIGINAL path, never from serve_path: `main.js.br` guesses as
+            // application/octet-stream, and a script served with that Content-Type is refused
+            // outright by browsers under X-Content-Type-Options: nosniff. Content-Encoding
+            // describes the transfer coding; Content-Type must still describe the payload.
             let mime_type = mime_guess::from_path(&path).first_or_text_plain();
-            (
-                [(axum::http::header::CONTENT_TYPE, mime_type.to_string())],
-                content,
-            ).into_response()
+            builder
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime_type.to_string())
+                .body(axum::body::Body::from(content))
+                .unwrap()
+                .into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
     }
@@ -845,12 +1101,32 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
         }
     }
     
-    // Handle headers
+    // Handle headers.
+    //
+    // [FIX 2026-08-25] A repeated header must be RECOMBINED into one FastCGI param, not
+    // overwritten. `params.insert` replaced any earlier value for the same key, so when a
+    // client sent a header more than once only the LAST occurrence reached PHP. This bit
+    // Cookie hardest: under HTTP/2 (which we now negotiate) clients are encouraged to split
+    // the cookie list into several `cookie` header fields (RFC 7540 §8.1.2.5), and Chromium
+    // does exactly that — so PHP received only the last field and dropped PHPSESSID, logging
+    // the user out on every click. Firefox sends a single `cookie` field, which is why it was
+    // unaffected. RFC 3875 §4.1.18 requires repeated headers be joined with ", ", except the
+    // Cookie header, whose own grammar joins with "; ".
+    let mut header_params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (name, value) in parts.headers.iter() {
+        let Ok(val) = value.to_str() else { continue };
         let key = format!("HTTP_{}", name.as_str().replace('-', "_").to_uppercase());
-        if let Ok(val) = value.to_str() {
-             params.insert(Cow::Owned(key), Cow::Owned(val.to_string()));
-        }
+        let sep = if name == axum::http::header::COOKIE { "; " } else { ", " };
+        header_params
+            .entry(key)
+            .and_modify(|existing| {
+                existing.push_str(sep);
+                existing.push_str(val);
+            })
+            .or_insert_with(|| val.to_string());
+    }
+    for (key, val) in header_params {
+        params.insert(Cow::Owned(key), Cow::Owned(val));
     }
     
     // Content Headers
@@ -937,4 +1213,32 @@ fn parse_php_response(stdout: Vec<u8>) -> Response {
     };
 
     (status_code, headers, body_data).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode_path;
+
+    #[test]
+    fn decodes_spaces_so_static_files_resolve() {
+        // The bug: spaced uploads 404'd because "%20" was never decoded before disk lookup.
+        assert_eq!(percent_decode_path("/uploads/Luton%204.jpg"), "/uploads/Luton 4.jpg");
+        assert_eq!(
+            percent_decode_path("/uploads/WhatsApp%20Image%202026-04-24%20at%2009.05.48.jpeg"),
+            "/uploads/WhatsApp Image 2026-04-24 at 09.05.48.jpeg"
+        );
+    }
+
+    #[test]
+    fn plain_paths_are_unchanged() {
+        assert_eq!(percent_decode_path("/uploads/i2mage.png"), "/uploads/i2mage.png");
+        assert_eq!(percent_decode_path("/index.php"), "/index.php");
+    }
+
+    #[test]
+    fn encoded_traversal_is_revealed_for_the_dotdot_guard() {
+        // Decoding must happen BEFORE the ".." check so encoded traversal can't slip through.
+        let decoded = percent_decode_path("/%2e%2e/%2e%2e/etc/passwd");
+        assert!(decoded.contains(".."), "decoded form must expose '..' to the guard: {decoded}");
+    }
 }
