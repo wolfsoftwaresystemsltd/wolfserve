@@ -1,6 +1,6 @@
 [package]
 name = "wolfserve"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 description = "A high-performance web server written in Rust that serves PHP applications via FastCGI"

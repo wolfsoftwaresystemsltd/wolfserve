@@ -1027,6 +1027,23 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "PHP-FPM address not configured").into_response(),
     };
 
+    // [FIX 2026-08-26] Read the request body BEFORE connecting to PHP-FPM.
+    //
+    // The connection used to be opened first and then sat idle while the client's body
+    // was collected — for a slow client upload that is many seconds, and php-fpm's
+    // dynamic process manager reaps workers holding silent connections, closing the
+    // socket. wolfserve then hit EPIPE writing the buffered body ("FastCGI Error:
+    // Broken pipe (os error 32)") — uploads over ~30MB from a home connection failed
+    // every time, while the same body posted from localhost (fast) succeeded. Buffering
+    // the body first shrinks the idle window to microseconds; it is also the polite
+    // thing to do to the backend (nginx buffers uploads before opening the upstream
+    // connection for the same reason).
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read body").into_response(),
+    };
+
     // Basic FastCGI connection to PHP-FPM with timeout and optional Unix socket support
     let fpm_connect_timeout = Duration::from_secs(2);
 
@@ -1047,13 +1064,6 @@ async fn handle_php_fpm(state: Arc<AppState>, req: Request, script_path: PathBuf
             Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, format!("PHP-FPM unreachable at {}: {}", fpm_addr, e)).into_response(),
             Err(_) => return (StatusCode::GATEWAY_TIMEOUT, format!("PHP-FPM connect timed out ({})", fpm_addr)).into_response(),
         }
-    };
-
-    // Read body
-    let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read body").into_response(),
     };
 
     let script_filename = match std::fs::canonicalize(&script_path) {
